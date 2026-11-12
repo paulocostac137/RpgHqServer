@@ -3,24 +3,14 @@ import json
 import os
 import websockets
 
-# =====================================================
-# CONFIGURAÇÕES
-# =====================================================
-
 HOST = "0.0.0.0"
 PORTA = int(os.environ.get("PORT", 8765))
 
-# Cada sala contém:
-# {
-#   "users": [websocket_A, websocket_B],
-#   "controller": websocket_que_tem_o_controle
-# }
+# Cada sala mantém os usuários na ordem de entrada.
+# O primeiro recebe A e o segundo recebe B.
 salas = {}
+lock_salas = asyncio.Lock()
 
-
-# =====================================================
-# ENVIO DE MENSAGENS
-# =====================================================
 
 async def enviar(usuario, mensagem):
     try:
@@ -29,35 +19,24 @@ async def enviar(usuario, mensagem):
         pass
 
 
-async def enviar_para_sala(codigo, mensagem, incluir_remetente=True):
-    sala = salas.get(codigo)
-    if sala is None:
+async def enviar_para_sala(sala, mensagem, exceto=None):
+    estado = salas.get(sala)
+
+    if not estado:
         return
 
-    for usuario in list(sala["users"]):
-        if incluir_remetente or usuario is not mensagem.get("_sender"):
+    for usuario in list(estado["usuarios"]):
+        if usuario is not exceto:
             await enviar(usuario, mensagem)
 
 
-async def avisar_parceiro(codigo, remetente, mensagem):
-    sala = salas.get(codigo)
-    if sala is None:
-        return
-
-    for outro in list(sala["users"]):
-        if outro is not remetente:
-            await enviar(outro, mensagem)
-
-
-# =====================================================
-# CONEXÃO DOS USUÁRIOS
-# =====================================================
-
 async def conectar(websocket):
-    codigo_sala = None
+
+    sala_usuario = None
+    papel_usuario = None
+    restantes = []
 
     try:
-        # A primeira mensagem obrigatoriamente identifica a sala.
         primeira_mensagem = await asyncio.wait_for(
             websocket.recv(),
             timeout=30
@@ -81,65 +60,80 @@ async def conectar(websocket):
             })
             return
 
-        sala = salas.setdefault(codigo, {
-            "users": [],
-            "controller": None
-        })
+        async with lock_salas:
 
-        if len(sala["users"]) >= 2:
-            await enviar(websocket, {
-                "type": "error",
-                "message": "Este par já possui dois usuários."
-            })
-            return
+            estado = salas.setdefault(
+                codigo,
+                {
+                    "usuarios": [],
+                    "controlador": None
+                }
+            )
 
-        # A ordem de entrada determina os papéis.
-        papel = "A" if len(sala["users"]) == 0 else "B"
+            if len(estado["usuarios"]) >= 2:
+                await enviar(websocket, {
+                    "type": "error",
+                    "message": "Este par já possui dois usuários."
+                })
+                return
 
-        sala["users"].append(websocket)
-        websocket.sala = codigo
-        websocket.papel = papel
-        codigo_sala = codigo
+            papel_usuario = (
+                "A" if not estado["usuarios"] else "B"
+            )
+
+            estado["usuarios"].append(websocket)
+
+            websocket.sala = codigo
+            websocket.papel = papel_usuario
+
+            sala_usuario = codigo
+            quantidade = len(estado["usuarios"])
 
         await enviar(websocket, {
             "type": "joined",
             "pair": codigo,
-            "users": len(sala["users"]),
-            "role": papel
+            "users": quantidade,
+            "role": papel_usuario
         })
 
         print(
-            f"Usuário {papel} conectado à sala {codigo}. "
-            f"Participantes: {len(sala['users'])}"
+            f"Usuário {papel_usuario} conectado à sala {codigo}. "
+            f"Participantes: {quantidade}"
         )
 
-        # Quando o segundo usuário entra, avisa o primeiro.
-        if len(sala["users"]) == 2:
-            await avisar_parceiro(codigo, websocket, {
-                "type": "peer_connected",
-                "role": papel
-            })
+        if quantidade == 2:
 
-        # Recebe os comandos enviados durante a sessão.
+            await enviar_para_sala(
+                codigo,
+                {"type": "peer_connected"}
+            )
+
         async for mensagem in websocket:
+
             try:
                 dados = json.loads(mensagem)
+            except (json.JSONDecodeError, TypeError):
+                continue
 
-                if dados.get("type") != "control":
+            if dados.get("type") != "control":
+                continue
+
+            ativo = dados.get("active")
+
+            if not isinstance(ativo, bool):
+                continue
+
+            async with lock_salas:
+
+                estado = salas.get(codigo)
+
+                if not estado or websocket not in estado["usuarios"]:
                     continue
 
-                ativo = dados.get("active")
-
-                if not isinstance(ativo, bool):
-                    continue
-
-                sala_atual = salas.get(codigo)
-                if sala_atual is None:
-                    continue
-
-                controlador = sala_atual["controller"]
+                controlador = estado["controlador"]
 
                 if ativo:
+
                     progresso = dados.get("progress")
 
                     if (
@@ -148,106 +142,131 @@ async def conectar(websocket):
                     ):
                         continue
 
-                    progresso = max(0.0, min(1.0, float(progresso)))
-
-                    # O primeiro usuário que solicitar assume o controle.
                     if controlador is None:
-                        sala_atual["controller"] = websocket
+
+                        estado["controlador"] = websocket
                         controlador = websocket
 
                         await enviar(websocket, {
                             "type": "control_granted",
-                            "role": websocket.papel
+                            "role": papel_usuario
                         })
 
-                        print(
-                            f"Controle concedido ao usuário "
-                            f"{websocket.papel} na sala {codigo}."
-                        )
+                    elif controlador is not websocket:
 
-                    # O usuário que já controla pode continuar enviando.
-                    if controlador is websocket:
-                        await avisar_parceiro(codigo, websocket, {
-                            "type": "control",
-                            "active": True,
-                            "progress": progresso,
-                            "role": websocket.papel
-                        })
-                    else:
-                        # Não permite que o segundo usuário interrompa o dono.
                         await enviar(websocket, {
                             "type": "control_busy",
-                            "role": getattr(controlador, "papel", "")
+                            "controller": getattr(
+                                controlador,
+                                "papel",
+                                ""
+                            )
                         })
+
+                        continue
+
+                    resposta = {
+                        "type": "control",
+                        "active": True,
+                        "progress": max(
+                            0.0,
+                            min(1.0, float(progresso))
+                        ),
+                        "controller": papel_usuario
+                    }
+
+                    await enviar_para_sala(
+                        codigo,
+                        resposta,
+                        exceto=websocket
+                    )
 
                 else:
-                    # Só o dono atual pode liberar a trava.
-                    if sala_atual["controller"] is websocket:
-                        sala_atual["controller"] = None
 
-                        await avisar_parceiro(codigo, websocket, {
+                    if controlador is websocket:
+
+                        estado["controlador"] = None
+
+                        resposta = {
                             "type": "control",
                             "active": False,
-                            "role": websocket.papel
-                        })
+                            "controller": papel_usuario
+                        }
+
+                        await enviar_para_sala(
+                            codigo,
+                            resposta,
+                            exceto=websocket
+                        )
 
                         await enviar(websocket, {
                             "type": "control_released"
                         })
 
-                        print(
-                            f"Controle liberado pelo usuário "
-                            f"{websocket.papel} na sala {codigo}."
-                        )
-
-            except (json.JSONDecodeError, TypeError, ValueError):
-                continue
-
     except asyncio.TimeoutError:
-        print("Conexão encerrada por falta de identificação.")
+
+        print(
+            "Conexão encerrada por falta de identificação."
+        )
 
     except websockets.exceptions.ConnectionClosed:
         pass
 
+    except Exception as erro:
+
+        print(f"Erro na conexão: {erro}")
+
+        await enviar(websocket, {
+            "type": "error",
+            "message": "Erro interno no servidor."
+        })
+
     finally:
-        if codigo_sala is not None:
-            sala = salas.get(codigo_sala)
 
-            if sala is not None:
-                # Se quem desconectou era o controlador, libera a trava.
-                if sala["controller"] is websocket:
-                    sala["controller"] = None
+        if sala_usuario is not None:
 
-                    for outro in list(sala["users"]):
-                        if outro is not websocket:
-                            await enviar(outro, {
+            async with lock_salas:
+
+                estado = salas.get(sala_usuario)
+
+                if estado and websocket in estado["usuarios"]:
+
+                    if estado["controlador"] is websocket:
+
+                        estado["controlador"] = None
+
+                        await enviar_para_sala(
+                            sala_usuario,
+                            {
                                 "type": "control",
                                 "active": False,
-                                "role": websocket.papel
-                            })
+                                "controller": papel_usuario
+                            },
+                            exceto=websocket
+                        )
 
-                if websocket in sala["users"]:
-                    sala["users"].remove(websocket)
+                    estado["usuarios"].remove(websocket)
 
-                for outro in list(sala["users"]):
-                    await enviar(outro, {
-                        "type": "peer_disconnected",
-                        "role": websocket.papel
-                    })
+                    restantes = list(estado["usuarios"])
 
-                if not sala["users"]:
-                    salas.pop(codigo_sala, None)
+                    if not restantes:
+                        salas.pop(sala_usuario, None)
+
+            for outro in restantes:
+
+                await enviar(outro, {
+                    "type": "peer_disconnected",
+                    "role": papel_usuario
+                })
 
             print(
-                f"Usuário desconectado da sala {codigo_sala}."
+                f"Usuário {papel_usuario} desconectado "
+                f"da sala {sala_usuario}."
             )
 
 
-# =====================================================
-# INICIALIZAÇÃO DO SERVIDOR
-# =====================================================
-
 async def main():
+
     print("--------------------------------")
     print(" RPGHQCONSPIRATION - SERVIDOR")
     print("--------------------------------")
