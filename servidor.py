@@ -1,434 +1,168 @@
 import asyncio
 import json
-import math
 import os
-import time
-
 import websockets
 
-
-# ============================================================
+# =========================================
 # CONFIGURAÇÕES
-# ============================================================
+# =========================================
 
 HOST = "0.0.0.0"
 PORTA = int(os.environ.get("PORT", 8765))
 
-MAX_USUARIOS_POR_SALA = 2
-TEMPO_LIMITE_ENTRADA = 30
-TAMANHO_MAXIMO_MENSAGEM = 4096
+LIMITE_CICLOS_LIBERACAO = 5
+LIMITE_CICLOS_SOLTAR = 3
 
-# Cada sala contém seus participantes e seu controlador.
+LIMITE_EXTREMO_SUPERIOR = 0.15
+LIMITE_EXTREMO_INFERIOR = 0.85
+
 salas = {}
+estados_salas = {}
 
 
-# ============================================================
-# ESTRUTURA DAS SALAS
-# ============================================================
+# =========================================
+# ESTADO DAS SALAS
+# =========================================
 
-def criar_sala():
-
+def criar_estado_sala():
     return {
-        "participantes": [],
-        "controlador": None,
-        "sequencia": 0,
-        "criada_em": time.time()
+        "ciclos_a": 0,
+        "extremo_inicial_a": -1,
+        "alcancou_oposto_a": False,
+        "usuario_b_liberado": False
     }
 
 
-def obter_sala(codigo):
-
-    if codigo not in salas:
-        salas[codigo] = criar_sala()
-
-    return salas[codigo]
-
-
-def atribuir_papel(sala):
-
-    papeis_ocupados = {
-        getattr(usuario, "papel", "")
-        for usuario in sala["participantes"]
-    }
-
-    if "A" not in papeis_ocupados:
-        return "A"
-
-    if "B" not in papeis_ocupados:
-        return "B"
-
-    return None
-
-
-# ============================================================
+# =========================================
 # ENVIO DE MENSAGENS
-# ============================================================
+# =========================================
 
 async def enviar(usuario, mensagem):
-
     try:
-
-        await usuario.send(
-            json.dumps(
-                mensagem,
-                ensure_ascii=False,
-                allow_nan=False
-            )
-        )
-
-        return True
-
-    except (
-        websockets.exceptions.ConnectionClosed,
-        TypeError,
-        ValueError
-    ):
-
-        return False
+        await usuario.send(json.dumps(mensagem))
+    except websockets.exceptions.ConnectionClosed:
+        pass
 
 
-async def enviar_para_par(usuario, mensagem):
-
-    codigo = getattr(usuario, "sala", None)
-
-    if codigo is None:
-        return
-
-    sala = salas.get(codigo)
+async def encaminhar_para_par(usuario, mensagem):
+    sala = getattr(usuario, "sala", None)
 
     if sala is None:
         return
 
-    for outro in list(sala["participantes"]):
+    participantes = salas.get(sala, set())
 
+    for outro in list(participantes):
         if outro != usuario:
             await enviar(outro, mensagem)
 
 
-async def enviar_para_sala(codigo, mensagem):
+# =========================================
+# LIBERAÇÃO DOS CONTROLES DE B
+# =========================================
 
-    sala = salas.get(codigo)
+async def liberar_usuario_b(codigo):
+    estado = estados_salas.get(codigo)
 
-    if sala is None:
+    if estado is None:
         return
 
-    for usuario in list(sala["participantes"]):
-        await enviar(usuario, mensagem)
-
-
-# ============================================================
-# VALIDAÇÃO DOS DADOS
-# ============================================================
-
-def validar_progresso(valor):
-
-    if isinstance(valor, bool):
-        return None
-
-    if not isinstance(valor, (int, float)):
-        return None
-
-    if not math.isfinite(valor):
-        return None
-
-    return max(0.0, min(1.0, float(valor)))
-
-
-def validar_inteiro(valor, minimo=0, maximo=None):
-
-    if isinstance(valor, bool):
-        return None
-
-    if not isinstance(valor, int):
-        return None
-
-    if valor < minimo:
-        return None
-
-    if maximo is not None and valor > maximo:
-        return None
-
-    return valor
-
-
-# ============================================================
-# CONTROLE EXCLUSIVO
-# ============================================================
-
-async def processar_controle(usuario, sala, dados):
-
-    ativo = dados.get("active")
-
-    if not isinstance(ativo, bool):
+    if estado["usuario_b_liberado"]:
         return
 
-    controlador = sala["controlador"]
+    estado["usuario_b_liberado"] = True
 
-    # --------------------------------------------------------
-    # SOLICITAÇÃO OU ATUALIZAÇÃO DE MOVIMENTO
-    # --------------------------------------------------------
+    participantes = salas.get(codigo, set())
 
-    if ativo:
-
-        progresso = validar_progresso(
-            dados.get("progress")
-        )
-
-        if progresso is None:
-            return
-
-        # Ninguém controla a sala.
-        if controlador is None:
-
-            sala["controlador"] = usuario
-
-            controlador = usuario
-
+    for usuario in list(participantes):
+        if getattr(usuario, "papel_usuario", "") == "B":
             await enviar(usuario, {
-                "type": "control_granted",
-                "role": usuario.papel
+                "type": "unlock_b"
             })
-
-            print(
-                f"Controle concedido a {usuario.papel} "
-                f"na sala {usuario.sala}."
-            )
-
-        # O próprio usuário já possui o controle.
-        elif controlador != usuario:
-
-            await enviar(usuario, {
-                "type": "control_busy",
-                "message": "O outro aparelho está controlando."
-            })
-
-            return
-
-        sala["sequencia"] += 1
-
-        await enviar_para_par(usuario, {
-            "type": "control",
-            "active": True,
-            "progress": progresso,
-            "role": usuario.papel,
-            "sequence": sala["sequencia"],
-            "server_time_ms": int(time.time() * 1000)
-        })
-
-        return
-
-    # --------------------------------------------------------
-    # LIBERAÇÃO DO CONTROLE
-    # --------------------------------------------------------
-
-    if controlador != usuario:
-
-        # Um aparelho que não possui o controle
-        # não pode liberar o controle do parceiro.
-        return
-
-    sala["controlador"] = None
-
-    sala["sequencia"] += 1
-
-    await enviar(usuario, {
-        "type": "control_released"
-    })
-
-    await enviar_para_par(usuario, {
-        "type": "control",
-        "active": False,
-        "role": usuario.papel,
-        "sequence": sala["sequencia"],
-        "server_time_ms": int(time.time() * 1000)
-    })
 
     print(
-        f"Controle liberado por {usuario.papel} "
-        f"na sala {usuario.sala}."
+        f"Controles do usuário B liberados na sala {codigo}."
     )
 
 
-# ============================================================
-# SINCRONIZAÇÃO DOS GIFS B, C E D
-# ============================================================
+# =========================================
+# CONTAGEM DOS MOVIMENTOS DE A
+# =========================================
 
-ACOES_GIF = {
-    "frame",
-    "play",
-    "pause",
-    "select",
-    "reset"
-}
+async def registrar_movimento_usuario_a(
+    codigo,
+    progresso
+):
+    estado = estados_salas.get(codigo)
 
-GIFS_PERMITIDOS = {
-    "B",
-    "C",
-    "D"
-}
-
-
-async def processar_sincronizacao(usuario, sala, dados):
-
-    # Somente o aparelho autorizado pode enviar
-    # comandos de sincronização.
-    if sala["controlador"] != usuario:
+    if estado is None:
         return
 
-    gif = dados.get("gif")
-    acao = dados.get("action")
-
-    # As duas validações abaixo impedem que valores
-    # de outros tipos sejam utilizados nas verificações.
-    if not isinstance(gif, str):
+    if estado["usuario_b_liberado"]:
         return
 
-    if not isinstance(acao, str):
+    extremo_atual = -1
+
+    if progresso <= LIMITE_EXTREMO_SUPERIOR:
+        extremo_atual = 0
+
+    elif progresso >= LIMITE_EXTREMO_INFERIOR:
+        extremo_atual = 1
+
+    if extremo_atual == -1:
         return
 
-    if gif not in GIFS_PERMITIDOS:
+    if estado["extremo_inicial_a"] == -1:
+
+        estado["extremo_inicial_a"] = extremo_atual
         return
 
-    if acao not in ACOES_GIF:
+    if (
+        not estado["alcancou_oposto_a"]
+        and extremo_atual != estado["extremo_inicial_a"]
+    ):
+
+        estado["alcancou_oposto_a"] = True
         return
 
-    mensagem = {
-        "type": "gif_sync",
-        "gif": gif,
-        "action": acao,
-        "sequence": None,
-        "role": usuario.papel,
-        "server_time_ms": int(time.time() * 1000)
-    }
+    if (
+        estado["alcancou_oposto_a"]
+        and extremo_atual == estado["extremo_inicial_a"]
+    ):
 
-    # Quadro atual, quando aplicável.
-    if "frame" in dados:
+        estado["ciclos_a"] += 1
 
-        quadro = validar_inteiro(
-            dados.get("frame")
+        estado["alcancou_oposto_a"] = False
+
+        print(
+            f"Sala {codigo}: "
+            f"A completou {estado['ciclos_a']} movimentos."
         )
 
-        if quadro is None:
-            return
+        # Cinco movimentos completos:
+        # libera B imediatamente, mesmo com os botões pressionados.
 
-        mensagem["frame"] = quadro
+        if estado["ciclos_a"] >= LIMITE_CICLOS_LIBERACAO:
 
-    # Posição temporal do GIF.
-    if "position_ms" in dados:
-
-        posicao = validar_inteiro(
-            dados.get("position_ms")
-        )
-
-        if posicao is None:
-            return
-
-        mensagem["position_ms"] = posicao
-
-    # Duração total do GIF.
-    if "duration_ms" in dados:
-
-        duracao = validar_inteiro(
-            dados.get("duration_ms"),
-            minimo=1
-        )
-
-        if duracao is None:
-            return
-
-        mensagem["duration_ms"] = duracao
-
-    # Estado de reprodução.
-    if "playing" in dados:
-
-        reproduzindo = dados.get("playing")
-
-        if not isinstance(reproduzindo, bool):
-            return
-
-        mensagem["playing"] = reproduzindo
-
-    sala["sequencia"] += 1
-
-    mensagem["sequence"] = sala["sequencia"]
-
-    await enviar_para_par(usuario, mensagem)
+            await liberar_usuario_b(codigo)
 
 
-# ============================================================
-# PROCESSAMENTO DAS MENSAGENS
-# ============================================================
-
-async def processar_mensagem(usuario, sala, mensagem):
-
-    try:
-
-        dados = json.loads(mensagem)
-
-    except (json.JSONDecodeError, TypeError):
-
-        return
-
-    if not isinstance(dados, dict):
-        return
-
-    tipo = dados.get("type")
-
-    if tipo == "control":
-
-        await processar_controle(
-            usuario,
-            sala,
-            dados
-        )
-
-    elif tipo == "gif_sync":
-
-        await processar_sincronizacao(
-            usuario,
-            sala,
-            dados
-        )
-
-
-# ============================================================
-# CONEXÃO E ENTRADA NA SALA
-# ============================================================
+# =========================================
+# CONEXÃO DOS USUÁRIOS
+# =========================================
 
 async def conectar(websocket):
 
     sala_usuario = None
-    papel_usuario = None
 
     try:
 
-        # Aguarda a identificação do aparelho.
         primeira_mensagem = await asyncio.wait_for(
             websocket.recv(),
-            timeout=TEMPO_LIMITE_ENTRADA
+            timeout=30
         )
 
-        try:
-
-            dados = json.loads(primeira_mensagem)
-
-        except (json.JSONDecodeError, TypeError):
-
-            await enviar(websocket, {
-                "type": "error",
-                "message": "Mensagem inicial inválida."
-            })
-
-            return
-
-        if not isinstance(dados, dict):
-
-            await enviar(websocket, {
-                "type": "error",
-                "message": "Identificação inválida."
-            })
-
-            return
+        dados = json.loads(primeira_mensagem)
 
         if dados.get("type") != "join":
 
@@ -452,13 +186,12 @@ async def conectar(websocket):
 
             return
 
-        # Obtém ou cria a sala.
-        sala = obter_sala(codigo)
+        participantes = salas.setdefault(
+            codigo,
+            set()
+        )
 
-        participantes = sala["participantes"]
-
-        # Verifica o limite de usuários.
-        if len(participantes) >= MAX_USUARIOS_POR_SALA:
+        if len(participantes) >= 2:
 
             await enviar(websocket, {
                 "type": "error",
@@ -467,63 +200,134 @@ async def conectar(websocket):
 
             return
 
-        # Atribui o primeiro papel disponível.
-        papel_usuario = atribuir_papel(sala)
+        # A ordem de entrada determina o papel.
 
-        if papel_usuario is None:
+        papel = "A" if len(participantes) == 0 else "B"
 
-            await enviar(websocket, {
-                "type": "error",
-                "message": "Não há posições disponíveis."
-            })
-
-            return
-
-        # Registra o usuário.
+        websocket.papel_usuario = papel
         websocket.sala = codigo
-        websocket.papel = papel_usuario
 
-        participantes.append(websocket)
+        participantes.add(websocket)
 
         sala_usuario = codigo
 
-        # Informa sua identificação.
+        if codigo not in estados_salas:
+            estados_salas[codigo] = criar_estado_sala()
+
         await enviar(websocket, {
             "type": "joined",
             "pair": codigo,
-            "role": papel_usuario,
-            "users": len(participantes)
+            "users": len(participantes),
+            "role": papel
         })
 
         print(
-            f"Usuário {papel_usuario} conectado "
-            f"à sala {codigo}. "
+            f"Usuário {papel} conectado à sala {codigo}. "
             f"Participantes: {len(participantes)}"
         )
 
-        # Quando o segundo usuário entra,
-        # avisa o primeiro.
         if len(participantes) == 2:
 
-            await enviar_para_par(websocket, {
-                "type": "peer_connected",
-                "users": 2
-            })
+            await encaminhar_para_par(
+                websocket,
+                {
+                    "type": "peer_connected"
+                }
+            )
 
-        # ----------------------------------------------------
-        # RECEBIMENTO CONTÍNUO DE MENSAGENS
-        # ----------------------------------------------------
+        # =================================
+        # RECEBIMENTO DOS COMANDOS
+        # =================================
 
         async for mensagem in websocket:
 
-            if not isinstance(mensagem, str):
-                continue
+            try:
 
-            await processar_mensagem(
-                websocket,
-                sala,
-                mensagem
-            )
+                dados = json.loads(mensagem)
+
+                tipo = dados.get("type")
+
+                if tipo != "control":
+                    continue
+
+                ativo = dados.get("active")
+
+                if not isinstance(ativo, bool):
+                    continue
+
+                resposta = {
+                    "type": "control",
+                    "active": ativo
+                }
+
+                progresso = None
+
+                if ativo:
+
+                    progresso = dados.get("progress")
+
+                    if (
+                        not isinstance(progresso, (int, float))
+                        or isinstance(progresso, bool)
+                    ):
+                        continue
+
+                    progresso = max(
+                        0.0,
+                        min(1.0, float(progresso))
+                    )
+
+                    resposta["progress"] = progresso
+
+                # Encaminha o movimento normalmente.
+
+                await encaminhar_para_par(
+                    websocket,
+                    resposta
+                )
+
+                # Somente A pode liberar os controles de B.
+
+                if papel == "A":
+
+                    if ativo:
+
+                        await registrar_movimento_usuario_a(
+                            codigo,
+                            progresso
+                        )
+
+                    else:
+
+                        estado = estados_salas.get(codigo)
+
+                        if estado is not None:
+
+                            # Três movimentos completos e soltura:
+                            # libera B.
+
+                            if (
+                                estado["ciclos_a"]
+                                >= LIMITE_CICLOS_SOLTAR
+                            ):
+
+                                await liberar_usuario_b(codigo)
+
+                            else:
+
+                                # Movimento insuficiente:
+                                # reinicia a contagem para a próxima tentativa.
+
+                                estado["ciclos_a"] = 0
+                                estado["extremo_inicial_a"] = -1
+                                estado["alcancou_oposto_a"] = False
+
+            except (
+                json.JSONDecodeError,
+                TypeError
+            ):
+
+                continue
 
     except asyncio.TimeoutError:
 
@@ -531,109 +335,48 @@ async def conectar(websocket):
             "Conexão encerrada por falta de identificação."
         )
 
-        await enviar(websocket, {
-            "type": "error",
-            "message": "Tempo limite para entrar na sala."
-        })
-
     except websockets.exceptions.ConnectionClosed:
 
         pass
 
-    except Exception as erro:
-
-        print(
-            f"Erro na conexão: {erro}"
-        )
-
     finally:
-
-        # ----------------------------------------------------
-        # DESCONECTAR E LIMPAR A SALA
-        # ----------------------------------------------------
 
         if sala_usuario is not None:
 
-            sala = salas.get(sala_usuario)
+            participantes = salas.get(sala_usuario)
 
-            if sala is not None:
+            if participantes is not None:
 
-                participantes = sala["participantes"]
+                participantes.discard(websocket)
 
-                if websocket in participantes:
+                for outro in list(participantes):
 
-                    era_controlador = (
-                        sala["controlador"] == websocket
-                    )
+                    await enviar(outro, {
+                        "type": "peer_disconnected"
+                    })
 
-                    participantes.remove(websocket)
+                if not participantes:
 
-                    # Libera o controle se o controlador saiu.
-                    if era_controlador:
+                    salas.pop(sala_usuario, None)
+                    estados_salas.pop(sala_usuario, None)
 
-                        sala["controlador"] = None
-
-                        sala["sequencia"] += 1
-
-                        await enviar_para_sala(
-                            sala_usuario,
-                            {
-                                "type": "control",
-                                "active": False,
-                                "role": papel_usuario,
-                                "sequence": sala["sequencia"],
-                                "server_time_ms": int(
-                                    time.time() * 1000
-                                )
-                            }
-                        )
-
-                        await enviar_para_sala(
-                            sala_usuario,
-                            {
-                                "type": "control_released"
-                            }
-                        )
-
-                    # Informa a saída do parceiro.
-                    await enviar_para_sala(
-                        sala_usuario,
-                        {
-                            "type": "peer_disconnected",
-                            "role": papel_usuario
-                        }
-                    )
-
-                    print(
-                        f"Usuário {papel_usuario} "
-                        f"desconectado da sala {sala_usuario}."
-                    )
-
-                    # Remove a sala quando estiver vazia.
-                    if not participantes:
-
-                        salas.pop(sala_usuario, None)
-
-                        print(
-                            f"Sala {sala_usuario} encerrada."
-                        )
+            print(
+                f"Usuário desconectado da sala {sala_usuario}."
+            )
 
 
-# ============================================================
+# =========================================
 # INICIALIZAÇÃO
-# ============================================================
+# =========================================
 
 async def main():
 
-    print("----------------------------------------")
-    print("       RPGHQCONSPIRATION SERVER")
-    print("----------------------------------------")
-
-    print(f"Host: {HOST}")
-    print(f"Porta: {PORTA}")
-    print("Protocolo: WebSocket")
-    print("Sincronização: GIF B, C e D")
-    print("----------------------------------------")
+    print("--------------------------------")
+    print(" RPGHQCONSPIRATION - SERVIDOR")
+    print("--------------------------------")
+    print(f"Servidor iniciado na porta {PORTA}")
+    print("Aguardando usuários...")
+    print("--------------------------------")
 
     async with websockets.serve(
         conectar,
@@ -641,21 +384,12 @@ async def main():
         PORTA,
         ping_interval=20,
         ping_timeout=20,
-        max_size=TAMANHO_MAXIMO_MENSAGEM
+        max_size=4096
     ):
-
-        print("Servidor iniciado.")
-        print("Aguardando usuários...")
 
         await asyncio.Future()
 
 
 if __name__ == "__main__":
 
-    try:
-
-        asyncio.run(main())
-
-    except KeyboardInterrupt:
-
-        print("Servidor encerrado.")
+    asyncio.run(main())
